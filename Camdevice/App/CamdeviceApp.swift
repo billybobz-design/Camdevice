@@ -22,7 +22,7 @@ enum Palette {
     static let accent = Color(red: 0.74, green: 0.99, blue: 0.52)
 }
 
-private enum Tab { case transfer, photos }
+private enum Tab { case transfer, photos, preview }
 
 private struct DeviceExportRequest: Identifiable {
     let mode: DeviceExport
@@ -66,7 +66,8 @@ struct HomeView: View {
             Rectangle().fill(Palette.line).frame(width: 1)
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
-                    if tab == .transfer { transfer }
+                    if tab == .preview { FocusPreviewView() }
+                    else if tab == .transfer { transfer }
                     else { photos }
                 }
                 .frame(maxWidth: 930)
@@ -77,15 +78,24 @@ struct HomeView: View {
         .frame(minWidth: 720, minHeight: 515)
         .background(Palette.background)
         .task(id: folderRefreshID) { await loadPhotoFolder() }
-        .onChange(of: photoFolderBookmark) { _, _ in refreshPhotoFolder() }
+        .task(id: photoFolder?.url) {
+            if let folder = photoFolder { await watchPhotoFolder(folder) }
+        }
+        .onChange(of: photoFolderBookmark) { _, _ in
+            photoFolder = nil
+            folderPhotos = []
+            folderUnavailable = false
+            finishSelecting()
+            refreshPhotoFolder()
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active && !photoFolderBookmark.isEmpty { refreshPhotoFolder() }
         }
         .sheet(item: $deviceExport) { request in
-            DeviceExportView(mode: request.mode, photoFolderName: request.destination?.url.lastPathComponent) { photos in
+            DeviceExportView(mode: request.mode, photoFolderName: request.destination?.url.lastPathComponent) { photos, mirrorJPEG in
                 deviceExport = nil
                 if let destination = request.destination {
-                    await receivePhotos(photos, in: destination)
+                    await receivePhotos(photos, in: destination, mirrorJPEG: mirrorJPEG)
                 }
             }
         }
@@ -110,6 +120,7 @@ struct HomeView: View {
             }
             .padding(.bottom, 24)
             tabButton("传输", icon: "arrow.down.to.line", destination: .transfer)
+            tabButton("USB 实时取景", icon: "viewfinder", destination: .preview)
             tabButton("照片文件夹", icon: "folder", destination: .photos)
             Spacer()
             Text("-NCPA最终兵器-")
@@ -153,7 +164,7 @@ struct HomeView: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("最近保存").font(.headline).accessibilityAddTraits(.isHeader)
+                    Text("最近添加").font(.headline).accessibilityAddTraits(.isHeader)
                     Spacer()
                     if !folderPhotos.isEmpty {
                         Button("查看照片") { tab = .photos }
@@ -161,7 +172,7 @@ struct HomeView: View {
                     }
                 }
                 if folderPhotos.isEmpty {
-                    Text("从设备保存的照片会显示在这里。")
+                    Text("照片文件夹中新加入的照片会显示在这里。")
                         .font(.subheadline).foregroundStyle(Palette.muted)
                 } else {
                     photoGrid(Array(folderPhotos.prefix(3)), columns: Array(repeating: GridItem(.flexible()), count: 3))
@@ -334,7 +345,7 @@ struct HomeView: View {
         choosingPhotoFolder = true
         let panel = NSOpenPanel()
         panel.title = "选择照片文件夹"
-        panel.message = "从 ESP32 导出的照片会直接保存到这个文件夹。"
+        panel.message = "从 ESP32 导出的照片会直接保存到这里。旧版内置相册的照片也会在首次迁移时复制到这里。"
         panel.prompt = "使用此文件夹"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -357,7 +368,6 @@ struct HomeView: View {
                 return
             }
             photoFolderBookmark = try folder.bookmark()
-            finishSelecting()
             refreshPhotoFolder()
         } catch {
             report("无法记住这个文件夹。请重新选择位置。", title: "无法使用该文件夹")
@@ -395,17 +405,46 @@ struct HomeView: View {
         }
     }
 
-    private func receivePhotos(_ urls: [URL], in destination: PhotoFolder) async {
+    private func receivePhotos(_ urls: [URL], in destination: PhotoFolder, mirrorJPEG: Bool) async {
         guard !urls.isEmpty, operation == nil else { return }
         operation = .receiving
         let result = await Task.detached(priority: .userInitiated) {
-            destination.save(urls, validatingImages: true)
+            destination.save(urls, validatingImages: true, mirroringJPEG: mirrorJPEG)
         }.value
         refreshPhotoFolder()
         operation = nil
         if result.saved > 0 { tab = .photos }
         if result.failed > 0 {
-            report("已保存 \(result.saved) 张，另有 \(result.failed) 张未能保存。请检查照片文件夹的权限和可用空间。")
+            report("已保存 \(result.saved) 张，另有 \(result.failed) 张未能处理或保存。")
+        }
+    }
+
+    private func watchPhotoFolder(_ folder: PhotoFolder) async {
+        let changes = folder.changes()
+        let migration = await Task.detached(priority: .utility) {
+            Result { try folder.migrateLegacyPhotos() }
+        }.value
+        guard !Task.isCancelled else { return }
+
+        switch migration {
+        case let .success(result):
+            if let result {
+                if result.saved > 0 { refreshPhotoFolder() }
+                if result.failed > 0 {
+                    report("有 \(result.failed) 张旧照片未能复制。原照片仍在旧相册中。", title: "旧照片迁移未完成")
+                }
+            }
+        case .failure:
+            report("暂时无法读取旧相册。", title: "旧照片迁移未完成")
+        }
+
+        for await _ in changes {
+            do {
+                try await Task.sleep(for: .milliseconds(200))
+            } catch {
+                return
+            }
+            refreshPhotoFolder()
         }
     }
 
@@ -500,5 +539,70 @@ private struct PhotoDetail: View {
         .padding(20)
         .frame(width: 620, height: 500)
         .background(Palette.background)
+    }
+}
+
+private struct FocusPreviewView: View {
+    @State private var ports = SerialCamera.ports()
+    @State private var port = SerialCamera.ports().first ?? ""
+    @State private var running = false
+    @State private var frame: NSImage?
+    @State private var enlarged = false
+    @State private var message = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("USB 实时取景").font(.largeTitle.bold())
+            Text("转动镜头调焦，可放大画面中央检查细节。").foregroundStyle(Palette.muted)
+            HStack {
+                if ports.isEmpty {
+                    Text("等待 USB 相机").foregroundStyle(Palette.muted)
+                } else {
+                    Picker("串口", selection: $port) {
+                        ForEach(ports, id: \.self) { Text($0).tag($0) }
+                    }.disabled(running)
+                }
+                Button(running ? "停止取景" : "开始取景") {
+                    frame = nil
+                    message = ""
+                    running.toggle()
+                }.disabled(port.isEmpty && !running)
+                Toggle("中心放大 2×", isOn: $enlarged).toggleStyle(.button)
+            }
+            ZStack {
+                Color.black
+                if let frame {
+                    Image(nsImage: frame).resizable().scaledToFit().scaleEffect(enlarged ? 2 : 1)
+                } else if running {
+                    ProgressView("正在获取画面…")
+                }
+            }.aspectRatio(4/3, contentMode: .fit).clipped()
+            if !message.isEmpty { Text(message).foregroundStyle(Palette.muted) }
+        }
+        .task {
+            while !Task.isCancelled {
+                let available = SerialCamera.ports()
+                ports = available
+                if !running && !available.contains(port) { port = available.first ?? "" }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+        .task(id: running) {
+            guard running else { return }
+            do {
+                try await SerialCamera(port: port).withPreviewFrames { frames in
+                    for try await jpeg in frames {
+                        guard !Task.isCancelled else { return }
+                        guard let image = NSImage(data: jpeg) else { throw CocoaError(.fileReadCorruptFile) }
+                        frame = image
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                frame = nil
+                message = error.localizedDescription
+                running = false
+            }
+        }
     }
 }

@@ -66,6 +66,45 @@ struct SerialCamera: Identifiable, Sendable {
         }
     }
 
+    func withPreviewFrames(_ consume: (AsyncThrowingStream<Data, Error>) async throws -> Void) async throws {
+        let (frames, continuation) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask(priority: .userInitiated) {
+                do {
+                    try withConnection { connection in
+                        defer { try? connection.send("vx") }
+                        while !Task.isCancelled {
+                            try connection.send("vf")
+                            let deadline = ProcessInfo.processInfo.systemUptime + 6
+                            var header = try connection.line(until: deadline)
+                            while header.hasPrefix("Camera ready:") {
+                                header = try connection.line(until: deadline)
+                            }
+                            if header == "ERROR Use pz or dc." {
+                                throw SerialCameraError.device("请刷入支持 USB 实时取景的相机固件。")
+                            }
+                            if header.hasPrefix("ERROR ") { throw SerialCameraError.device(header) }
+                            guard let match = header.wholeMatch(of: #/FRAME ([1-9][0-9]{0,6})/#),
+                                  let count = Int(match.1), count <= 1_048_576 else {
+                                throw SerialCameraError.invalidResponse
+                            }
+                            let frame = try connection.bytes(count, until: deadline)
+                            guard frame.starts(with: [0xff, 0xd8]), frame.suffix(2).elementsEqual([0xff, 0xd9]) else {
+                                throw SerialCameraError.invalidResponse
+                            }
+                            continuation.yield(frame)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            defer { group.cancelAll() }
+            try await consume(frames)
+        }
+    }
+
     func takePhoto() throws {
         try withConnection { connection in
             try connection.send("pz")
@@ -209,6 +248,13 @@ private final class SerialConnection {
             guard pending.count <= 1024 else { throw SerialCameraError.invalidResponse }
             try fill(until: deadline)
         }
+    }
+
+    func bytes(_ count: Int, until deadline: TimeInterval) throws -> Data {
+        while pending.count < count { try fill(until: deadline) }
+        let result = Data(pending.prefix(count))
+        pending.removeFirst(count)
+        return result
     }
 
     func copy(_ count: Int, to file: FileHandle) throws {

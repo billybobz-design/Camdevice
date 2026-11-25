@@ -12,9 +12,10 @@ enum DeviceExport: String, Identifiable {
 struct DeviceExportView: View {
     let mode: DeviceExport
     let photoFolderName: String?
-    let onPhotos: ([URL]) async -> Void
+    let onPhotos: ([URL], Bool) async -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("mirrorJPEGOnExport") private var mirrorJPEGOnExport = true
     @StateObject private var bluetooth = BluetoothDiscovery()
     @State private var usbDevices: [USBDevice] = []
     @State private var serialCameras: [SerialCamera] = []
@@ -141,6 +142,8 @@ struct DeviceExportView: View {
             Text(photoFolderName.map { "保存到「\($0)」" } ?? "请在传输页选择照片文件夹后再导出。")
                 .font(.footnote)
                 .foregroundStyle(Palette.muted)
+            Toggle("导出时左右镜像 JPEG 照片", isOn: $mirrorJPEGOnExport)
+                .disabled(busy)
         }
         if readingPhotos { ProgressView("正在读取设备照片…").font(.subheadline) }
         if takingPhoto { ProgressView("正在拍照…").font(.subheadline) }
@@ -223,6 +226,7 @@ struct DeviceExportView: View {
     }
 
     private func readPhotos(temporaryFolder: URL? = nil, load: @escaping @Sendable () throws -> [URL]) {
+        let mirrorJPEG = mirrorJPEGOnExport
         readingPhotos = true
         cameraMessage = nil
         Task {
@@ -236,7 +240,7 @@ struct DeviceExportView: View {
                     report("设备的 DCIM 文件夹里没有可导出的照片。")
                     return
                 }
-                await onPhotos(photos)
+                await onPhotos(photos, mirrorJPEG)
             } catch {
                 report(error.localizedDescription)
                 refreshID = UUID()

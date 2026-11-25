@@ -63,7 +63,7 @@ pio run -e xiao_esp32s3_sense
 ### 当前功能
 
 - 固件支持实体快门和 USB 串口触发拍照。烧录后运行 `python3 tools/camdevice_terminal.py`，输入 `pz` 拍照，输入 `dc` 将设备里的照片导出到 `~/Desktop/Camdevice`。
-- App 首次使用时会请你选择照片文件夹。导出的照片直接写入该文件夹，在「照片文件夹」页可预览、在访达中打开或更换位置。旧版相册中的照片仍保存在 `~/Library/Application Support/PenCam/Album`。
+- App 首次使用时会请你选择照片文件夹。导出的照片直接写入该文件夹，在「照片文件夹」页可预览、在访达中打开或更换位置。「最近添加」按当前文件夹中的文件添加日期倒序排列，文件系统未提供添加日期时使用创建日期或修改日期。已有旧版内置相册时，App 会把照片复制到选定文件夹，原件仍保存在 `~/Library/Application Support/PenCam/Album`。
 - 用支持数据传输的 USB-C 线连接相机，关闭拍照终端或串口监视器，然后在 macOS 应用打开「USB-C 导出」。应用会识别运行 Camdevice 固件的相机，可直接拍照和导出照片，也支持符合设备识别约定的 USB 存储卷。
 - 更新相机固件后，在「USB-C 导出」中选择「清理闪存照片」并确认，即可删除板载 LittleFS 里的 Camdevice 照片。microSD 和 Mac 文件夹里的照片会保留。
 - macOS 应用支持发现兼容的 BLE 设备。蓝牙照片传输尚未实现。

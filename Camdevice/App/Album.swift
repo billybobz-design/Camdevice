@@ -1,6 +1,9 @@
 import Foundation
 import ImageIO
 import AppKit
+import Darwin
+import CoreImage
+import UniformTypeIdentifiers
 
 struct Photo: Identifiable, Equatable {
     private static let imageExtensions: Set<String> = [
@@ -48,6 +51,11 @@ struct PhotoFolder: Sendable {
     }
 
     let url: URL
+    static let legacyAlbum = URL.applicationSupportDirectory.appending(path: "PenCam/Album", directoryHint: .isDirectory)
+
+    private static let legacyMigrationLock = NSLock()
+    private static let legacyMigrationKey = "didCopyLegacyAlbumToPhotoFolder"
+    private static let fileKeys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey]
 
     init(url: URL) {
         self.url = url
@@ -64,7 +72,7 @@ struct PhotoFolder: Sendable {
     }
 
     func photos() throws -> [Photo] {
-        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .creationDateKey]
+        let keys = Self.fileKeys.union([.addedToDirectoryDateKey, .creationDateKey, .contentModificationDateKey])
         return try FileManager.default.contentsOfDirectory(
             at: url, includingPropertiesForKeys: Array(keys), options: .skipsHiddenFiles
         ).compactMap { item -> (photo: Photo, date: Date)? in
@@ -72,7 +80,8 @@ struct PhotoFolder: Sendable {
                   values.isRegularFile == true, values.isSymbolicLink == false else {
                 return nil
             }
-            return (Photo(url: item), values.creationDate ?? .distantPast)
+            let date = values.addedToDirectoryDate ?? values.creationDate ?? values.contentModificationDate
+            return (Photo(url: item), date ?? .distantPast)
         }
         .sorted { first, second in
             if first.date != second.date { return first.date > second.date }
@@ -81,7 +90,55 @@ struct PhotoFolder: Sendable {
         .map(\.photo)
     }
 
-    func save(_ urls: [URL], validatingImages: Bool = false) -> FileResult {
+    func changes() -> AsyncStream<Void> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let fd = Darwin.open(url.path(percentEncoded: false), O_EVTONLY | O_CLOEXEC)
+            guard fd >= 0 else {
+                continuation.finish()
+                return
+            }
+            let monitor = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd, eventMask: [.write, .rename, .delete, .revoke], queue: .global(qos: .utility)
+            )
+            monitor.setEventHandler { continuation.yield() }
+            monitor.setCancelHandler { Darwin.close(fd) }
+            continuation.onTermination = { _ in monitor.cancel() }
+            monitor.activate()
+        }
+    }
+
+    func migrateLegacyPhotos(from legacyFolder: URL = Self.legacyAlbum,
+                             defaults: UserDefaults = .standard) throws -> FileResult? {
+        Self.legacyMigrationLock.lock()
+        defer { Self.legacyMigrationLock.unlock() }
+        guard !defaults.bool(forKey: Self.legacyMigrationKey) else { return nil }
+
+        let files = FileManager.default
+        let directoryKeys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+        let entries: [URL]
+        do {
+            entries = try files.contentsOfDirectory(at: legacyFolder, includingPropertiesForKeys: Array(directoryKeys),
+                                                    options: .skipsHiddenFiles)
+        } catch CocoaError.fileReadNoSuchFile {
+            entries = []
+        }
+        let sources = try entries.flatMap { entry -> [URL] in
+            let data = try entry.resourceValues(forKeys: directoryKeys)
+            guard data.isDirectory == true, data.isSymbolicLink == false else { return [] }
+            return try files.contentsOfDirectory(at: entry, includingPropertiesForKeys: Array(Self.fileKeys),
+                                                 options: .skipsHiddenFiles).filter { item in
+                guard Photo.supports(item) else { return false }
+                let values = try item.resourceValues(forKeys: Self.fileKeys)
+                return values.isRegularFile == true && values.isSymbolicLink == false
+            }
+        }
+        let result = save(sources, validatingImages: true, skippingIdenticalCopies: true)
+        if result.failed == 0 { defaults.set(true, forKey: Self.legacyMigrationKey) }
+        return result
+    }
+
+    func save(_ urls: [URL], validatingImages: Bool = false, skippingIdenticalCopies: Bool = false,
+              mirroringJPEG: Bool = false) -> FileResult {
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
         let files = FileManager.default
@@ -96,6 +153,9 @@ struct PhotoFolder: Sendable {
 
             do {
                 try copyFile(at: source, to: staging)
+                if mirroringJPEG && ["jpg", "jpeg"].contains(fileExtension.lowercased()) {
+                    try mirrorJPEG(at: staging)
+                }
                 if validatingImages {
                     guard let image = CGImageSourceCreateWithURL(staging as CFURL, nil),
                           CGImageSourceCreateThumbnailAtIndex(image, 0, [
@@ -121,6 +181,13 @@ struct PhotoFolder: Sendable {
                         saved += 1
                         break
                     } catch CocoaError.fileWriteFileExists {
+                        if skippingIdenticalCopies,
+                           let values = try? target.resourceValues(forKeys: Self.fileKeys),
+                           values.isRegularFile == true, values.isSymbolicLink == false,
+                           files.contentsEqual(atPath: staging.path, andPath: target.path) {
+                            saved += 1
+                            break
+                        }
                         suffix += 1
                     }
                 }
@@ -129,6 +196,50 @@ struct PhotoFolder: Sendable {
             }
         }
         return FileResult(saved: saved, failed: urls.count - saved)
+    }
+
+    private func mirrorJPEG(at url: URL) throws {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        var properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
+        let orientation = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value
+            ?? Int32(CGImagePropertyOrientation.up.rawValue)
+        let transform = CIImage(cgImage: image).orientationTransform(forExifOrientation: orientation)
+        let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        let upright = bounds.applying(transform)
+        let data = NSMutableData()
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let bitmap = CGContext(data: nil, width: Int(upright.width), height: Int(upright.height),
+                                     bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace,
+                                     bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+              let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        bitmap.translateBy(x: upright.width, y: 0)
+        bitmap.scaleBy(x: -1, y: 1)
+        bitmap.translateBy(x: -upright.minX, y: -upright.minY)
+        bitmap.concatenate(transform)
+        bitmap.draw(image, in: bounds)
+        guard let output = bitmap.makeImage() else { throw CocoaError(.fileWriteUnknown) }
+
+        properties[kCGImagePropertyOrientation as String] = CGImagePropertyOrientation.up.rawValue
+        properties[kCGImagePropertyPixelWidth as String] = output.width
+        properties[kCGImagePropertyPixelHeight as String] = output.height
+        properties[kCGImageDestinationLossyCompressionQuality as String] = 0.95
+        if var tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any] {
+            tiff[kCGImagePropertyTIFFOrientation as String] = CGImagePropertyOrientation.up.rawValue
+            properties[kCGImagePropertyTIFFDictionary as String] = tiff
+        }
+        if var exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any] {
+            exif[kCGImagePropertyExifPixelXDimension as String] = output.width
+            exif[kCGImagePropertyExifPixelYDimension as String] = output.height
+            properties[kCGImagePropertyExifDictionary as String] = exif
+        }
+        CGImageDestinationAddImage(destination, output, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw CocoaError(.fileWriteUnknown) }
+        try (data as Data).write(to: url)
     }
 
     private func copyFile(at source: URL, to target: URL) throws {

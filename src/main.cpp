@@ -28,7 +28,21 @@ int stableButton = HIGH;
 uint32_t rawChangedAt = 0;
 unsigned nextPhoto = 1;
 
+// Keep the APB clock at 80 MHz so USB, SPI and camera timing remain stable.
+constexpr uint32_t idleCpuMHz = 80;
+constexpr uint32_t cameraCpuMHz = 240;
+
+void enterIdle() {
+    if (!setCpuFrequencyMhz(idleCpuMHz)) {
+        Serial.println("ERROR Could not lower CPU frequency.");
+    }
+}
+
 bool setupCamera() {
+    if (!setCpuFrequencyMhz(cameraCpuMHz)) {
+        Serial.println("ERROR Could not raise CPU frequency.");
+        return false;
+    }
     camera_config_t config{};
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -59,6 +73,7 @@ bool setupCamera() {
 
     const esp_err_t error = esp_camera_init(&config);
     if (error != ESP_OK) {
+        enterIdle();
         Serial.printf("Camera init failed: 0x%X\n", static_cast<unsigned>(error));
         return false;
     }
@@ -159,13 +174,49 @@ bool capturePhoto() {
     return true;
 }
 
+bool previewActive = false;
+uint32_t lastPreviewFrame = 0;
+
+esp_err_t stopCamera() {
+    const esp_err_t result = esp_camera_deinit();
+    enterIdle();
+    return result;
+}
+
+void stopPreview() {
+    if (previewActive) {
+        if (stopCamera() != ESP_OK) {
+            Serial.println("ERROR Could not stop preview camera.");
+        }
+        previewActive = false;
+    }
+}
+
+void sendPreviewFrame() {
+    if (!previewActive && !setupCamera()) {
+        Serial.println("ERROR Preview camera unavailable.");
+        return;
+    }
+    previewActive = true;
+    camera_fb_t *frame = esp_camera_fb_get();
+    if (frame && frame->format == PIXFORMAT_JPEG && frame->len > 0) {
+        Serial.printf("FRAME %u\n", static_cast<unsigned>(frame->len));
+        Serial.write(frame->buf, frame->len);
+    } else {
+        Serial.println("ERROR Preview capture failed.");
+    }
+    if (frame) esp_camera_fb_return(frame);
+    lastPreviewFrame = millis();
+}
+
 void takePhoto() {
+    stopPreview();
     if (!photoStorage || !setupCamera()) {
         Serial.println("ERROR Camera or photo storage unavailable.");
         return;
     }
     const bool saved = capturePhoto();
-    const esp_err_t stopped = esp_camera_deinit();
+    const esp_err_t stopped = stopCamera();
     if (stopped != ESP_OK) {
         Serial.printf("ERROR Camera shutdown failed: 0x%X. Reset the board.\n",
                       static_cast<unsigned>(stopped));
@@ -298,7 +349,11 @@ void handleSerial() {
             if (count != 2) {
                 continue;
             }
-            if (command[0] == 'p' && command[1] == 'z') {
+            if (command[0] == 'v' && command[1] == 'f') {
+                sendPreviewFrame();
+            } else if (command[0] == 'v' && command[1] == 'x') {
+                stopPreview();
+            } else if (command[0] == 'p' && command[1] == 'z') {
                 takePhoto();
             } else if (command[0] == 'd' && command[1] == 'c') {
                 exportPhotos();
@@ -306,6 +361,9 @@ void handleSerial() {
                 Serial.println("CAMDEVICE FLASH CLEAR 1");
             } else if (command[0] == 'c' && command[1] == 'l') {
                 clearFlashPhotos();
+            } else if (command[0] == 'p' && command[1] == 'w') {
+                Serial.printf("POWER CPU %u MHz CAMERA %s\n", static_cast<unsigned>(getCpuFrequencyMhz()),
+                              esp_camera_sensor_get() ? "ACTIVE" : "OFF");
             } else if (command[0] == 'i' && command[1] == 'd') {
                 Serial.println("CAMDEVICE READY 1");
             } else {
@@ -341,13 +399,15 @@ void setup() {
     rawChangedAt = millis();
 
     photoStorage = setupPhotoStorage();
+    enterIdle();
     Serial.println("Ready. Send pz to take a photo or dc to export over USB.");
 }
 
 void loop() {
+    if (previewActive && millis() - lastPreviewFrame > 3000) stopPreview();
     if (shutterPressed()) {
         takePhoto();
     }
     handleSerial();
-    delay(2);
+    delay(previewActive ? 2 : 10);
 }
