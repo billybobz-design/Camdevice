@@ -1,0 +1,16 @@
+.pio/
+.platformio-core/
+
+# Local IDE state and build output
+.vscode/
+DerivedData/
+build/
+xcuserdata/
+*.xcuserstate
+
+# Local files and generated drafts
+.DS_Store
+/generated_images/
+.env
+.env.*
+!.env.example
