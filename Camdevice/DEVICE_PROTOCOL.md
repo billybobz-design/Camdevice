@@ -1,4 +1,42 @@
-# Camdevice 设备识别约定
+# Camdevice Device Protocol
+
+[English](#english) · [简体中文](#简体中文)
+
+## English
+
+### Bluetooth Low Energy
+
+The device advertises BLE service UUID `C405D5C7-16FA-48EA-86C7-497F5BE293F0`. Its name can appear in the advertisement or the scan response. The macOS app scans for this service and lists the peripheral UUID assigned by CoreBluetooth, which can differ between Macs. BLE photo transfer is not implemented yet.
+
+### USB mass storage
+
+The device mounts on the Mac as a USB mass storage volume. Place a `CAMDEVICE.JSON` file like the following at the root of the volume.
+
+```json
+{
+  "serviceUUID": "C405D5C7-16FA-48EA-86C7-497F5BE293F0",
+  "uuid": "D8156E44-D285-4FEC-AD04-4A92B2653226",
+  "name": "My Camera"
+}
+```
+
+Each device should use its own persistent UUID. Store photos under `DCIM` at the root of the volume, or under its subdirectories. The app reads those photos when the user clicks **Export Photos (导出照片)**.
+
+### USB serial capture and export
+
+The firmware accepts commands over USB serial. In **USB-C Export (USB-C 导出)**, the macOS app sends `id\n` at 115200 baud to `/dev/cu.usbmodem*` ports and lists a camera when it receives `CAMDEVICE READY 1`. To use the terminal tool, first close the app's serial connection and the PlatformIO serial monitor, then run the following command from the project root.
+
+```sh
+python3 tools/camdevice_terminal.py
+```
+
+Enter `pz` to take a photo and save it to the microSD card or onboard LittleFS. The firmware initializes the camera before each capture and releases the driver afterward. On success it returns `OK Camera stopped.`. On failure it returns a status line starting with `ERROR `.
+
+The response to `dc` starts with `CAMDEVICE EXPORT 1`. Each photo has a header such as `FILE IMG_0001.JPG <byte count>`, followed by exactly that many JPEG bytes. The next header or the final `END` line immediately follows the JPEG data. The app writes photos to the folder selected by the user. The terminal tool writes to `~/Desktop/Camdevice` by default. Use `--port` to select a serial port, `--output` to change the destination, and `q` to exit.
+
+Use `fc` to query flash cleanup support. Compatible firmware replies with `CAMDEVICE FLASH CLEAR 1`. After the user confirms permanent deletion, the app sends `cl`. Firmware deletes regular files matching the `IMG_0000.JPG` naming format in the onboard LittleFS `DCIM` directory, even if the camera currently saves photos to the microSD card. The final reply is `CAMDEVICE FLASH CLEARED <deleted count> <failed count>`. A mount or directory read failure produces a status line starting with `ERROR `.
+
+## 简体中文
 
 ### 蓝牙
 
